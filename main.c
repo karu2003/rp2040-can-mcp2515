@@ -4,6 +4,16 @@
 #include "tusb.h"
 #include "gs_usb.h"
 
+#define SPI_PORT spi0       // SPI0
+#define PIN_MISO 8          // GPIO - MISO
+#define PIN_CS   19         // GPIO - CS (Chip Select)
+#define PIN_SCK  14         // GPIO - SCK
+#define PIN_MOSI 15         // GPIO - MOSI
+#define CAN_STBY 16         // GPIO - Standby
+#define TX0RTS   17         // GPIO - TX0RTS
+#define CAN_RESET   18      // GPIO - Reset
+#define CAN_INT 22          // GPIO - Interrupt
+#define RX0BF   23          // GPIO - RX0BF 
 struct usb_control_out_t {
     uint8_t bRequest;
     void *buffer;
@@ -45,8 +55,8 @@ const static uint8_t MCP2515_RXB0CTRL_BUKT = 1 << 2;
 const uint32_t CAN_STDMSGID_MAX = 0x7FF;
 const uint8_t SIDL_EXTENDED_MSGID = 1U << 3U;
 
-const static uint MCP2515_IRQ_GPIO = 20;
-const static uint32_t MCP2515_OSC_FREQ = 8000000;
+const static uint MCP2515_IRQ_GPIO = CAN_INT;
+const static uint32_t MCP2515_OSC_FREQ = 16000000;
 
 volatile struct gs_host_frame tx[MCP2515_TX_BUFS];
 
@@ -61,15 +71,15 @@ struct usb_control_out_t usb_control_out[] = {
 
 void spi_transmit(uint8_t *tx, uint8_t* rx, size_t len) {
     asm volatile("nop \n nop \n nop");
-    gpio_put(PICO_DEFAULT_SPI_CSN_PIN, 0);
+    gpio_put(PIN_CS, 0);
     asm volatile("nop \n nop \n nop");
     if(rx) {
-        spi_write_read_blocking(spi_default, tx, rx, len);
+        spi_write_read_blocking(SPI_PORT, tx, rx, len);
     } else {
-        spi_write_blocking(spi_default, tx, len);
+        spi_write_blocking(SPI_PORT, tx, len);
     }
     asm volatile("nop \n nop \n nop");
-    gpio_put(PICO_DEFAULT_SPI_CSN_PIN, 1);
+    gpio_put(PIN_CS, 1);
     asm volatile("nop \n nop \n nop");
 }
 
@@ -171,12 +181,12 @@ int main() {
         tx[i].echo_id = -1;
     }
 
-    spi_init(spi_default, 1000 * 1000);
-    gpio_set_function(PICO_DEFAULT_SPI_RX_PIN, GPIO_FUNC_SPI);
-    gpio_set_function(PICO_DEFAULT_SPI_SCK_PIN, GPIO_FUNC_SPI);
-    gpio_set_function(PICO_DEFAULT_SPI_TX_PIN, GPIO_FUNC_SPI);
-    gpio_init(PICO_DEFAULT_SPI_CSN_PIN);
-    gpio_set_dir(PICO_DEFAULT_SPI_CSN_PIN, GPIO_OUT);
+    spi_init(SPI_PORT, 1000 * 1000);
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    gpio_init(PIN_CS);
+    gpio_set_dir(PIN_CS, GPIO_OUT);
 
     gpio_init(MCP2515_IRQ_GPIO);
     gpio_pull_up(MCP2515_IRQ_GPIO);
