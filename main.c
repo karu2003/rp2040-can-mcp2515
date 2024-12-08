@@ -1,6 +1,7 @@
 #include "gs_usb.h"
 #include "hardware/spi.h"
 #include "pico/stdlib.h"
+#include "pico/util/queue.h"
 #include "tusb.h"
 #include <assert.h>
 
@@ -12,7 +13,7 @@ const static uint32_t MCP2515_OSC_FREQ = 20000000;
 const static uint32_t MCP2515_OSC_FREQ = 8000000;
 #endif
 const static uint MCP2515_IRQ_GPIO = 20;
-const static spi_inst_t *MCP2515_SPI = spi_default;
+static spi_inst_t *MCP2515_SPI = spi_default;
 const static uint MCP2515_SPI_CSN_GPIO = PICO_DEFAULT_SPI_CSN_PIN;
 const static uint MCP2515_SPI_RX_GPIO = PICO_DEFAULT_SPI_RX_PIN;
 const static uint MCP2515_SPI_SCK_GPIO = PICO_DEFAULT_SPI_SCK_PIN;
@@ -20,7 +21,7 @@ const static uint MCP2515_SPI_TX_GPIO = PICO_DEFAULT_SPI_TX_PIN;
 #elif defined(BOARD_ADAFRUIT_CAN_FEATHER)
 const static uint32_t MCP2515_OSC_FREQ = 16000000;
 const static uint MCP2515_IRQ_GPIO = 22;
-const static spi_inst_t *MCP2515_SPI = spi1;
+static spi_inst_t *MCP2515_SPI = spi1;
 const static uint MCP2515_SPI_CSN_GPIO = 19;
 const static uint MCP2515_SPI_RX_GPIO = 8;
 const static uint MCP2515_SPI_SCK_GPIO = 14;
@@ -43,8 +44,10 @@ enum mcp2515_mode_t {
   MCP2515_MODE_CONFIG,
 };
 
+#define MCP2515_SPI_FREQ (10 * 1000 * 1000)
 #define MCP2515_RX_BUFS 2
 #define MCP2515_TX_BUFS 3
+#define RX_FRAMES_QUEUE_LEN 1024
 
 const static uint16_t MCP2515_CMD_RESET = 0b11000000;
 const static uint16_t MCP2515_CMD_WRITE = 0b00000010;
@@ -70,7 +73,7 @@ const static uint8_t MCP2515_RXB0CTRL_BUKT = 1 << 2;
 const uint32_t CAN_STDMSGID_MAX = 0x7FF;
 const uint8_t SIDL_EXTENDED_MSGID = 1U << 3U;
 
-volatile struct gs_host_frame tx[MCP2515_TX_BUFS];
+struct gs_host_frame tx[MCP2515_TX_BUFS];
 
 static uint32_t byte_order = 0;
 static struct gs_device_bittiming device_bittiming;
@@ -80,6 +83,8 @@ struct usb_control_out_t usb_control_out[] = {
     {GS_USB_BREQ_BITTIMING, &device_bittiming, sizeof(device_bittiming)},
     {GS_USB_BREQ_MODE, &device_mode, sizeof(device_mode)},
 };
+
+static queue_t rx_frames;
 
 void spi_transmit(uint8_t *tx, uint8_t *rx, size_t len) {
   asm volatile("nop \n nop \n nop");
@@ -173,9 +178,7 @@ void handle_rx(uint8_t rxn) {
     rxf.can_id = (rx[1] << 3U) | (rx[2] >> 5U);
   }
   memcpy(rxf.data, &rx[6], rxf.can_dlc);
-
-  tud_vendor_write(&rxf, sizeof(rxf));
-  tud_vendor_write_flush();
+  queue_try_add(&rx_frames, &rxf);
 }
 
 int main() {
@@ -185,7 +188,9 @@ int main() {
     tx[i].echo_id = -1;
   }
 
-  spi_init(MCP2515_SPI, 1000 * 1000);
+  queue_init(&rx_frames, sizeof(struct gs_host_frame), RX_FRAMES_QUEUE_LEN);
+
+  spi_init(MCP2515_SPI, MCP2515_SPI_FREQ);
   gpio_set_function(MCP2515_SPI_RX_GPIO, GPIO_FUNC_SPI);
   gpio_set_function(MCP2515_SPI_SCK_GPIO, GPIO_FUNC_SPI);
   gpio_set_function(MCP2515_SPI_TX_GPIO, GPIO_FUNC_SPI);
@@ -220,13 +225,21 @@ int main() {
         if (status & (1U << (3 + txn * 2))) {
           assert(tx[txn].echo_id != -1);
 
-          tud_vendor_write(&tx[txn], sizeof(tx[txn]));
-          tud_vendor_write_flush();
+          queue_try_add(&rx_frames, &tx[txn]);
           tx[txn].echo_id = -1;
 
           // ack irq
           mcp2515_bit_modify(MCP2515_CANINTF, 1 << (2 + txn), 0);
         }
+      }
+    }
+
+    // wait for empty buffer to send rx frames one by one
+    if (tud_vendor_write_available() == CFG_TUD_VENDOR_TX_BUFSIZE) {
+      struct gs_host_frame frame;
+      if (queue_try_remove(&rx_frames, &frame)) {
+        tud_vendor_write(&frame, sizeof(frame));
+        tud_vendor_write_flush();
       }
     }
 
@@ -237,10 +250,7 @@ int main() {
       if (txn >= 0) {
         struct gs_host_frame *frame = &tx[txn];
         uint32_t count = tud_vendor_read(frame, sizeof(*frame));
-        if (count != sizeof(*frame)) {
-          for (;;)
-            ;
-        }
+        assert(count == sizeof(*frame));
 
         size_t hdr_size = 6;
         uint8_t tx[hdr_size + sizeof(frame->data)];
